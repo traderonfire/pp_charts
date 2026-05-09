@@ -85,6 +85,12 @@ class PPPortfolio:
         self.transactions  = []   # list of dicts  (portfolio: BUY/SELL/DELIVERY)
         self.account_transactions = []  # list of dicts (cash: fees/dividends/etc)
 
+        # Cache the top-level securities list for O(1) reference resolution.
+        # PP XML references use 1-based indices into this exact list:
+        #   reference="../../securities/security[42]"
+        # Must use direct path (not recursive .//), matching PP's XPath semantics.
+        self._sec_list = client.findall("securities/security")
+
         self._parse_securities(client)
         self._parse_accounts(client)
         self._parse_transactions(client)       # also seeds prices from tx quotes
@@ -260,18 +266,19 @@ class PPPortfolio:
 
     def _resolve_ref(self, client, ref: str, context_el) -> str:
         """
-        PP XML uses XPath-like references such as
-        ../../../../../securities/security[2]
-        We walk up from context_el and find the target.
+        Resolve a PP XPath reference such as:
+            ../../../../../../securities/security[42]
+
+        PP uses 1-based indexing into the top-level <securities> list.
+        We use self._sec_list which is built from the direct child path
+        "securities/security" (not recursive) to match PP's semantics exactly.
         """
-        # Simple heuristic: extract index and find in securities list
         import re
-        m = re.search(r"securities/security(?:\[(\d+)\])?", ref)
+        m = re.search(r"securities/security(?:\[(\d+)\])?$", ref)
         if m:
             idx = int(m.group(1) or "1") - 1
-            secs = client.findall(".//securities/security")
-            if 0 <= idx < len(secs):
-                return _text(secs[idx], "uuid")
+            if 0 <= idx < len(self._sec_list):
+                return _text(self._sec_list[idx], "uuid")
         return ""
 
     # ── price lookup ──────────────────────────────────────────────────────
@@ -510,14 +517,43 @@ class PPPortfolio:
             s["name"] for s in self.securities.values() if s["name"]
         )
 
-    def uuid_for_name(self, name: str) -> str | None:
+    def uuid_for_name(self, query: str) -> str | None:
+        """
+        Find a security UUID by name, ticker symbol, or ISIN.
+        Matching priority:
+          1. Exact ticker (case-insensitive)
+          2. Exact ISIN  (case-insensitive)
+          3. Exact name  (case-insensitive)
+          4. Ticker prefix / substring
+          5. Name substring (case-insensitive)
+        """
+        q = query.strip().lower()
+
+        # 1. Exact ticker
         for uuid, s in self.securities.items():
-            if s["name"].lower() == name.lower():
+            if s["ticker"].lower() == q:
                 return uuid
-        # fuzzy: substring
+
+        # 2. Exact ISIN
         for uuid, s in self.securities.items():
-            if name.lower() in s["name"].lower():
+            if s["isin"].lower() == q:
                 return uuid
+
+        # 3. Exact name
+        for uuid, s in self.securities.items():
+            if s["name"].lower() == q:
+                return uuid
+
+        # 4. Ticker prefix or substring
+        for uuid, s in self.securities.items():
+            if s["ticker"] and q in s["ticker"].lower():
+                return uuid
+
+        # 5. Name substring
+        for uuid, s in self.securities.items():
+            if s["name"] and q in s["name"].lower():
+                return uuid
+
         return None
 
 
@@ -749,6 +785,8 @@ def parse_args():
                    help="Print raw price values and detected factor for each security, then exit")
     p.add_argument("--dump-xml-prices", dest="dump_xml_prices", metavar="NAME",
                    help="Dump raw XML price v-values for a named security before any conversion, then exit")
+    p.add_argument("--dump-raw-tx", dest="dump_raw_tx", metavar="NAME",
+                   help="Dump raw XML of first 5 transactions for a security (diagnose reference issues)")
     return p.parse_args()
 
 
@@ -766,6 +804,44 @@ def main():
           f"{len(pp.transactions)} portfolio transactions, "
           f"{len(pp.account_transactions)} cash account transactions found.")
     print(f"  Price factor auto-detected: {pp._price_factor:,}")
+
+    if args.dump_raw_tx:
+        import xml.etree.ElementTree as ET2
+        query  = args.dump_raw_tx
+        uuid   = pp.uuid_for_name(query)
+        target_name = pp.securities[uuid]["name"] if uuid else query
+        print(f"\nSearching transactions for: {target_name}")
+        found = 0
+        tree2 = ET.parse(xml_path)
+        root2 = tree2.getroot()
+        client2 = root2 if root2.tag == "client" else root2.find("client") or root2
+        for portfolio in client2.findall(".//portfolios/portfolio"):
+            pname = portfolio.findtext("name", "?")
+            for tx in portfolio.findall(".//transactions/portfolio-transaction"):
+                sec_el = tx.find("security")
+                if sec_el is None:
+                    continue
+                # show any transaction whose security element has uuid matching
+                # OR whose reference resolves to our target
+                sec_uuid_inline = sec_el.findtext("uuid", "")
+                ref_attr        = sec_el.get("reference", "")
+                match = (uuid and sec_uuid_inline == uuid) or                         (uuid and pp._resolve_ref(client2, ref_attr, portfolio) == uuid)
+                if match or (not uuid and query.lower() in ET2.tostring(sec_el, encoding="unicode").lower()):
+                    print(f"\n  Portfolio: {pname}")
+                    print(f"  TX raw XML snippet:")
+                    raw = ET2.tostring(tx, encoding="unicode")[:600]
+                    print("  " + raw[:600].replace("><", ">\n  <"))
+                    found += 1
+                    if found >= 5:
+                        break
+            if found >= 5:
+                break
+        if found == 0:
+            print("  No matching transactions found.")
+            print("  This confirms a reference resolution failure.")
+            print("  Try running with a security you know HAS transactions to")
+            print("  compare the XML structure.")
+        return
 
     if args.dump_xml_prices:
         name = args.dump_xml_prices
@@ -811,9 +887,15 @@ def main():
         return
 
     if args.list:
-        print("\nSecurities in this portfolio:")
-        for s in pp.security_names():
-            print(f"  • {s}")
+        print(f"\n{'Name':<55} {'Ticker':<10} {'ISIN'}")
+        print("-" * 85)
+        rows = sorted(
+            [(s["name"], s["ticker"], s["isin"])
+             for s in pp.securities.values() if s["name"]],
+            key=lambda r: r[0].lower()
+        )
+        for name, ticker, isin in rows:
+            print(f"  {name:<53} {ticker:<10} {isin}")
         return
 
     start = date.fromisoformat(args.date_from) if args.date_from else None
