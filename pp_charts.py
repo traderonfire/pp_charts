@@ -93,9 +93,15 @@ class PPPortfolio:
 
         self._parse_securities(client)
         self._parse_accounts(client)
-        self._parse_transactions(client)       # also seeds prices from tx quotes
+        self._parse_transactions(client)             # Version A: portfolio is primary element
+        self._parse_crossentry_portfolio_transactions(client)  # Version B: account is primary
         self._parse_account_transactions(client)
         self._autodetect_price_factor()        # figure out the raw v scale
+        self._autodetect_share_factor()        # figure out the shares raw scale
+        # Re-apply correct share factor to all transactions (crossEntry ones parsed early)
+        for t in self.transactions:
+            if t.get("shares_raw", 0) > 0:
+                t["shares"] = t["shares_raw"] / self._share_factor
         self._finalise_prices()                # sort price arrays for fast bisect lookup
         self._detect_price_mode()              # per-share vs total-value prices
 
@@ -124,6 +130,119 @@ class PPPortfolio:
                 "prices":    prices,       # populated after auto-detect
                 "prices_raw": prices_raw,  # raw integer v values
             }
+
+    def _parse_crossentry_portfolio_transactions(self, client):
+        """
+        Handle XStream Version B serialization: account-transaction is the primary
+        element and the portfolio-transaction is stored inline as <portfolioTransaction>
+        (camelCase) inside the <crossEntry> child.
+
+        XStream writes whichever Java object is encountered first during serialization
+        as the full element; the other side becomes a back-reference.  This means
+        in some portfolios the portfolio-transaction data lives here:
+
+          <account><transactions><account-transaction>
+            <crossEntry class="buysell">
+              <portfolioTransaction>          ← camelCase, inline, has shares/type/etc
+                <shares>230000000000</shares>
+                <type>BUY</type>
+                ...
+              </portfolioTransaction>
+            </crossEntry>
+          </account-transaction>
+        """
+        for account in client.findall(".//account"):
+            for acct_tx in account.findall("transactions/account-transaction"):
+                cross = acct_tx.find("crossEntry")
+                if cross is None:
+                    continue
+                # Look for inline portfolioTransaction (camelCase) child
+                ptx = cross.find("portfolioTransaction")
+                if ptx is None:
+                    continue
+                # Skip if it's just a reference (no children)
+                if ptx.get("reference") is not None and len(ptx) == 0:
+                    continue
+
+                tx_type = _text(ptx, "type").upper()
+                if tx_type not in ("BUY", "SELL", "TRANSFER_IN", "TRANSFER_OUT",
+                                   "DELIVERY_INBOUND", "DELIVERY_OUTBOUND"):
+                    continue
+
+                # Resolve security — may be on the account-transaction or the ptx
+                sec_uuid = None
+                for src in (ptx, acct_tx):
+                    sec_el = src.find("security")
+                    if sec_el is None:
+                        continue
+                    sec_uuid = sec_el.findtext("uuid", "")
+                    if not sec_uuid:
+                        ref = sec_el.get("reference", "")
+                        if ref:
+                            sec_uuid = self._resolve_ref(client, ref, account)
+                    if sec_uuid and sec_uuid in self.securities:
+                        break
+
+                if not sec_uuid or sec_uuid not in self.securities:
+                    continue
+
+                # Find the portfolio name via reference
+                port_name = "unknown"
+                port_ref_el = cross.find("portfolio")
+                if port_ref_el is not None:
+                    port_ref = port_ref_el.get("reference", "")
+                    if port_ref:
+                        # Resolve to find the portfolio element and its name
+                        for p in client.findall(".//portfolio"):
+                            if _text(p, "uuid"):
+                                # Try to match by walking the reference
+                                port_name = self.accounts.get(_text(p, "uuid"),
+                                                              _text(p, "name")) or port_name
+
+                # Check not already parsed (avoid double-counting)
+                tx_uuid = ptx.findtext("uuid", "")
+
+                shares_el = ptx.find("shares")
+                shares_raw = int(shares_el.text or "0") if shares_el is not None else 0
+                shares = shares_raw / self._share_factor if hasattr(self, '_share_factor') else shares_raw / NANO
+
+                amount_el = ptx.find("amount")
+                gross = int(amount_el.text or "0") / HECTO if amount_el is not None else 0.0
+
+                fees  = sum(_amount(u, "amount") for u in ptx.findall("units/unit[@type='FEE']"))
+                taxes = sum(_amount(u, "amount") for u in ptx.findall("units/unit[@type='TAX']"))
+
+                tx_date = _date(ptx) or _date(acct_tx)
+
+                # Seed price from quote element; store raw int for share factor detection
+                quote_el = ptx.find("quote")
+                raw_quote_int = 0
+                if quote_el is not None and quote_el.text:
+                    try:
+                        raw_quote_int = int(quote_el.text)
+                        q_factor = getattr(self, '_price_factor', QUOTE_FACTOR)
+                        q = raw_quote_int / q_factor
+                        if q > 0 and tx_date not in self.securities[sec_uuid]["prices"]:
+                            self.securities[sec_uuid]["prices"][tx_date] = q
+                    except (ValueError, TypeError):
+                        pass
+                elif shares > 0 and gross > 0:
+                    q = gross / shares
+                    if q > 0 and tx_date not in self.securities[sec_uuid]["prices"]:
+                        self.securities[sec_uuid]["prices"][tx_date] = q
+
+                self.transactions.append({
+                    "date":       tx_date,
+                    "type":       tx_type,
+                    "sec_uuid":   sec_uuid,
+                    "account":    port_name,
+                    "shares":     shares,
+                    "shares_raw": shares_raw,
+                    "raw_quote":  raw_quote_int,
+                    "gross":      gross,
+                    "fees":       fees,
+                    "taxes":      taxes,
+                })
 
     # ── accounts ──────────────────────────────────────────────────────────
 
@@ -178,12 +297,14 @@ class PPPortfolio:
                 amount_el = tx.find("amount")
                 amount = int(amount_el.text or "0") / HECTO if amount_el is not None else 0.0
 
+                tx_currency = tx.findtext("currencyCode", "").strip()
                 self.account_transactions.append({
                     "date":     _date(tx),
                     "type":     tx_type,
                     "sec_uuid": sec_uuid,
                     "account":  acct_name,
                     "amount":   amount,
+                    "currency": tx_currency,
                 })
 
     # ── transactions ──────────────────────────────────────────────────────
@@ -242,7 +363,9 @@ class PPPortfolio:
                 if not sec_uuid or sec_uuid not in self.securities:
                     continue
 
-                shares = _shares(tx)
+                shares_el = tx.find("shares")
+                shares_raw = int(shares_el.text or "0") if shares_el is not None else 0
+                shares = shares_raw / NANO   # preliminary; corrected after share factor detection
                 tx_date = _date(tx)
 
                 # gross amount is stored in the amount element (hecto)
@@ -261,10 +384,15 @@ class PPPortfolio:
                 # the security's prices dict.  Manual <prices> entries
                 # (already parsed) take precedence if they exist on same date
                 # because they're loaded first and we don't overwrite here.
+                # We also store raw_quote_int for share factor detection
+                # (avoids circular dependency where wrong shares → wrong seeded
+                # quote → wrong share factor detection).
                 quote_el = tx.find("quote")
+                raw_quote_int = 0
                 if quote_el is not None and quote_el.text:
                     try:
-                        q = int(quote_el.text) / QUOTE_FACTOR
+                        raw_quote_int = int(quote_el.text)
+                        q = raw_quote_int / QUOTE_FACTOR
                         if q > 0 and tx_date not in self.securities[sec_uuid]["prices"]:
                             self.securities[sec_uuid]["prices"][tx_date] = q
                     except (ValueError, TypeError):
@@ -277,14 +405,16 @@ class PPPortfolio:
                         self.securities[sec_uuid]["prices"][tx_date] = q
 
                 self.transactions.append({
-                    "date":      tx_date,
-                    "type":      tx_type,
-                    "sec_uuid":  sec_uuid,
-                    "account":   port_name,
-                    "shares":    shares,
-                    "gross":     gross,
-                    "fees":      fees,
-                    "taxes":     taxes,
+                    "date":       tx_date,
+                    "type":       tx_type,
+                    "sec_uuid":   sec_uuid,
+                    "account":    port_name,
+                    "shares":     shares,          # corrected after _autodetect_share_factor
+                    "shares_raw": shares_raw,      # raw integer for factor detection
+                    "raw_quote":  raw_quote_int,   # raw quote integer for share factor detection
+                    "gross":      gross,
+                    "fees":       fees,
+                    "taxes":      taxes,
                 })
 
     def _resolve_ref(self, client, ref: str, context_el) -> str:
@@ -305,6 +435,63 @@ class PPPortfolio:
         return ""
 
     # ── price lookup ──────────────────────────────────────────────────────
+
+    def _autodetect_share_factor(self):
+        """
+        Auto-detect the scale factor used to store share counts in the XML.
+        PP uses 1_000_000_000 (1e9) or 100_000_000 (1e8) depending on version.
+
+        Uses raw_quote integer from each transaction (already stored during parsing)
+        cross-referenced with gross amount to get correct_shares without any
+        circular dependency on the shares value itself:
+            correct_shares = gross / (raw_quote / price_factor)
+
+        The winning factor is applied globally to all transactions.
+        """
+        CANDIDATES = [100_000_000, 1_000_000_000]
+        import math
+
+        evidence = []
+        for t in self.transactions:
+            if t["shares_raw"] <= 0 or t["gross"] <= 0:
+                continue
+            raw_quote = t.get("raw_quote", 0)
+            if raw_quote <= 0:
+                continue
+            # Derive correct share count from gross and raw quote
+            # price_factor already detected; this is independent of shares
+            quote_display = raw_quote / self._price_factor
+            if quote_display <= 0:
+                continue
+            correct_shares = t["gross"] / quote_display
+            if correct_shares <= 0:
+                continue
+            evidence.append((t["shares_raw"], correct_shares))
+
+        if not evidence:
+            self._share_factor = NANO   # default
+        else:
+            best_factor = CANDIDATES[0]
+            best_score  = float("inf")
+            for factor in CANDIDATES:
+                score = 0.0
+                for raw, correct in evidence:
+                    candidate = raw / factor
+                    if candidate <= 0:
+                        score += 1e9
+                        continue
+                    score += (math.log(candidate) - math.log(correct)) ** 2
+                score /= len(evidence)
+                if score < best_score:
+                    best_score  = score
+                    best_factor = factor
+            self._share_factor = best_factor
+
+        # Re-seed tx quotes using correct price factor (already done) and
+        # apply correct share factor to all transactions
+        for t in self.transactions:
+            if t["shares_raw"] > 0:
+                t["shares"] = t["shares_raw"] / self._share_factor
 
     def _autodetect_price_factor(self):
         """
@@ -667,22 +854,46 @@ def build_series(
         d = day.date()
 
         # ── portfolio transactions (shares change hands) ──────────────
-        for t in portfolio_tx_by_date.get(d, []):
+        # Sort so OUTBOUNDs process before INBOUNDs on the same day,
+        # preventing momentary zero-holdings during paired broker transfers.
+        day_txs = sorted(portfolio_tx_by_date.get(d, []),
+                         key=lambda t: 0 if t["type"] in (
+                             "SELL", "DELIVERY_OUTBOUND", "TRANSFER_OUT") else 1)
+        for t in day_txs:
             typ = t["type"]
             g   = t["gross"]
-            if typ in ("BUY", "TRANSFER_IN", "DELIVERY_INBOUND"):
+            if typ == "BUY":
+                # Real cash outflow — increases invested capital
                 holdings[t["sec_uuid"]]   += t["shares"]
-                net_invest[t["sec_uuid"]] += g   # cash out → invested goes up
-            elif typ in ("SELL", "TRANSFER_OUT", "DELIVERY_OUTBOUND"):
+                net_invest[t["sec_uuid"]] += g
+            elif typ == "SELL":
+                # Real cash inflow — decreases invested capital
                 holdings[t["sec_uuid"]]    = max(
-                    holdings[t["sec_uuid"]] - t["shares"], 0.0
-                )
+                    holdings[t["sec_uuid"]] - t["shares"], 0.0)
+                net_invest[t["sec_uuid"]] -= g
+            elif typ in ("DELIVERY_INBOUND", "TRANSFER_IN"):
+                # Broker transfer in — shares arrive, cost basis preserved (not a new purchase)
+                holdings[t["sec_uuid"]] += t["shares"]
+                # Do NOT change net_invest — transfer is cash-flow neutral
+            elif typ in ("DELIVERY_OUTBOUND", "TRANSFER_OUT"):
+                # Broker transfer out — shares leave, cost basis preserved
+                frac = t["shares"] / max(holdings[t["sec_uuid"]], 1e-9)
+                frac = min(frac, 1.0)
+                # Carry the proportional invested capital with the shares
+                # (net_invest stays the same here; it will be restored by the matching INBOUND)
+                holdings[t["sec_uuid"]] = max(
+                    holdings[t["sec_uuid"]] - t["shares"], 0.0)
+                # Do NOT change net_invest — transfer is cash-flow neutral
                 net_invest[t["sec_uuid"]] -= g   # cash in → invested goes down
 
         # ── cash account transactions (no share movement) ─────────────
         for t in acct_tx_by_date.get(d, []):
             typ = t["type"]
             amt = t["amount"]
+            # Include all cash account transactions regardless of currency.
+            # PP stores amounts in the account's currency; for multi-currency
+            # portfolios this means some amounts may need FX conversion for
+            # perfect accuracy, but including them as-is is better than omitting.
             if typ in CASH_IN_TYPES:
                 net_invest[t["sec_uuid"]] -= amt  # money received → cost basis down
             elif typ in CASH_OUT_TYPES:
@@ -812,6 +1023,8 @@ def parse_args():
                    help="Dump raw XML of first 5 transactions for a security (diagnose reference issues)")
     p.add_argument("--list-tx", dest="list_tx", metavar="NAME",
                    help="List all parsed transactions for a security in date order (diagnose wrong values)")
+    p.add_argument("--list-accounts", action="store_true",
+                   help="List all accounts and portfolios found in the XML, with transaction counts")
     return p.parse_args()
 
 
@@ -828,7 +1041,15 @@ def main():
     print(f"  {len(pp.securities)} securities, "
           f"{len(pp.transactions)} portfolio transactions, "
           f"{len(pp.account_transactions)} cash account transactions found.")
-    print(f"  Price factor auto-detected: {pp._price_factor:,}")
+    print(f"  Price factor auto-detected: {pp._price_factor:,}  |  Share factor auto-detected: {pp._share_factor:,}")
+
+    if args.list_accounts:
+        print(f"\n{'Account/Portfolio':<40} {'UUID':<38} {'Tx count'}")
+        print("-" * 85)
+        for uuid, name in sorted(pp.accounts.items(), key=lambda x: x[1]):
+            tx_count = sum(1 for t in pp.transactions if t["account"] == name)
+            print(f"  {name:<38} {uuid:<38} {tx_count}")
+        return
 
     if args.list_tx:
         uuid = pp.uuid_for_name(args.list_tx)
@@ -854,42 +1075,56 @@ def main():
         return
 
     if args.dump_raw_tx:
-        import xml.etree.ElementTree as ET2
-        query  = args.dump_raw_tx
-        uuid   = pp.uuid_for_name(query)
+        query = args.dump_raw_tx
+        uuid  = pp.uuid_for_name(query)
         target_name = pp.securities[uuid]["name"] if uuid else query
-        print(f"\nSearching transactions for: {target_name}")
-        found = 0
+        print(f"\nSearching RAW XML for: {target_name}  (UUID: {uuid})")
+
         tree2 = ET.parse(xml_path)
         root2 = tree2.getroot()
         client2 = root2 if root2.tag == "client" else root2.find("client") or root2
-        for portfolio in client2.findall(".//portfolios/portfolio"):
-            pname = portfolio.findtext("name", "?")
-            for tx in portfolio.findall(".//transactions/portfolio-transaction"):
-                sec_el = tx.find("security")
-                if sec_el is None:
-                    continue
-                # show any transaction whose security element has uuid matching
-                # OR whose reference resolves to our target
-                sec_uuid_inline = sec_el.findtext("uuid", "")
-                ref_attr        = sec_el.get("reference", "")
-                match = (uuid and sec_uuid_inline == uuid) or                         (uuid and pp._resolve_ref(client2, ref_attr, portfolio) == uuid)
-                if match or (not uuid and query.lower() in ET2.tostring(sec_el, encoding="unicode").lower()):
-                    print(f"\n  Portfolio: {pname}")
-                    print(f"  TX raw XML snippet:")
-                    raw = ET2.tostring(tx, encoding="unicode")[:600]
-                    print("  " + raw[:600].replace("><", ">\n  <"))
-                    found += 1
-                    if found >= 5:
-                        break
-            if found >= 5:
-                break
+
+        # Search ALL portfolio-transaction elements anywhere in the document
+        # PP uses both kebab-case <portfolio-transaction> (Version A: portfolio primary)
+        # and camelCase <portfolioTransaction> (Version B: account primary, inline child)
+        found = 0
+        all_ptxs = list(client2.iter("portfolio-transaction")) +                    list(client2.iter("portfolioTransaction"))
+        for tx in all_ptxs:
+            sec_el = tx.find("security")
+            if sec_el is None:
+                continue
+            inline_uuid = sec_el.findtext("uuid", "")
+            ref_attr    = sec_el.get("reference", "")
+            uuid_match  = bool(uuid and inline_uuid == uuid)
+            ref_match   = bool(uuid and ref_attr and
+                               pp._resolve_ref(client2, ref_attr, tx) == uuid)
+            if uuid_match or ref_match:
+                raw   = ET.tostring(tx, encoding="unicode")
+                import re as _re
+                pretty = _re.sub(r">\s*<", ">\n    <", raw[:1000])
+                print(f"\n  [Match {found+1}] uuid_match={uuid_match} ref_match={ref_match}")
+                print(f"  ref_attr='{ref_attr}'  inline_uuid='{inline_uuid}'")
+                print("  " + pretty)
+                found += 1
+                if found >= 5:
+                    break
+
+        print(f"\nTotal matches in raw XML: {found}")
         if found == 0:
-            print("  No matching transactions found.")
-            print("  This confirms a reference resolution failure.")
-            print("  Try running with a security you know HAS transactions to")
-            print("  compare the XML structure.")
+            # Check if UUID appears anywhere at all
+            raw_full = ET.tostring(client2, encoding="unicode")
+            if uuid and uuid in raw_full:
+                import re as _re
+                occ = list(_re.finditer(_re.escape(uuid), raw_full))
+                print(f"UUID appears {len(occ)} times in XML but none in portfolio-transaction/security")
+                for i, m in enumerate(occ[:4]):
+                    ctx = raw_full[max(0,m.start()-300):m.end()+300]
+                    print(f"\n  Occurrence {i+1}:")
+                    print("  " + _re.sub(r">\s*<", ">\n  <", ctx))
+            else:
+                print("UUID not found anywhere in raw XML.")
         return
+
 
     if args.dump_xml_prices:
         name = args.dump_xml_prices
