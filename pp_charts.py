@@ -134,11 +134,12 @@ class PPPortfolio:
             name = _text(acc, "name")
             if uuid:
                 self.accounts[uuid] = name
-        # securities / portfolio accounts
-        for acc in client.findall(".//portfolios/portfolio"):
+        # securities / portfolio accounts — may be defined under <portfolios>
+        # OR inline inside <crossEntry> elements within account transactions
+        for acc in client.findall(".//portfolio"):
             uuid = _text(acc, "uuid")
             name = _text(acc, "name")
-            if uuid:
+            if uuid and uuid not in self.accounts:
                 self.accounts[uuid] = name
 
     def _parse_account_transactions(self, client):
@@ -189,14 +190,36 @@ class PPPortfolio:
 
     def _parse_transactions(self, client):
         """
-        Walk every <portfolio> (securities account) and collect its
-        <portfolio-transaction> entries.
+        Collect all <portfolio-transaction> elements from the document.
+
+        PP uses XStream serialization which stores BUY/SELL as cross-entries:
+        the <portfolio> containing the shares leg is defined INLINE inside a
+        <crossEntry> element within the cash account-transaction, not under
+        the top-level <portfolios> element.  We therefore search the entire
+        document for portfolio-transaction elements rather than walking only
+        <portfolios>.
+
+        Structure for BUY/SELL:
+          <accounts><account><transactions><account-transaction>
+            <crossEntry class="buysell">
+              <portfolio>                        ← defined here, not in <portfolios>
+                <transactions>
+                  <portfolio-transaction>...</>  ← shares leg we want
+                </transactions>
+              </portfolio>
+            </crossEntry>
+          </account-transaction>
+
+        Structure for DELIVERY / TRANSFER:
+          <portfolios><portfolio><transactions>
+            <portfolio-transaction>...</>        ← standalone, no cross-entry
+          </portfolios>
         """
-        for portfolio in client.findall(".//portfolios/portfolio"):
+        for portfolio in client.findall(".//portfolio"):
             port_uuid = _text(portfolio, "uuid")
             port_name = self.accounts.get(port_uuid, _text(portfolio, "name"))
 
-            for tx in portfolio.findall(".//transactions/portfolio-transaction"):
+            for tx in portfolio.findall("transactions/portfolio-transaction"):
                 tx_type = _text(tx, "type").upper()
                 if tx_type not in ("BUY", "SELL",
                                    "TRANSFER_IN",  "TRANSFER_OUT",
