@@ -810,6 +810,8 @@ def parse_args():
                    help="Dump raw XML price v-values for a named security before any conversion, then exit")
     p.add_argument("--dump-raw-tx", dest="dump_raw_tx", metavar="NAME",
                    help="Dump raw XML of first 5 transactions for a security (diagnose reference issues)")
+    p.add_argument("--list-tx", dest="list_tx", metavar="NAME",
+                   help="List all parsed transactions for a security in date order (diagnose wrong values)")
     return p.parse_args()
 
 
@@ -827,6 +829,29 @@ def main():
           f"{len(pp.transactions)} portfolio transactions, "
           f"{len(pp.account_transactions)} cash account transactions found.")
     print(f"  Price factor auto-detected: {pp._price_factor:,}")
+
+    if args.list_tx:
+        uuid = pp.uuid_for_name(args.list_tx)
+        if not uuid:
+            print(f"Security not found: {args.list_tx}")
+            sys.exit(1)
+        sec = pp.securities[uuid]
+        print(f"\nPortfolio transactions for: {sec['name']}")
+        print(f"{'Date':<12} {'Type':<22} {'Shares':>12} {'Gross':>14} {'Account'}")
+        print("-" * 80)
+        ptxs = sorted([t for t in pp.transactions if t['sec_uuid'] == uuid],
+                      key=lambda t: t['date'])
+        for t in ptxs:
+            print(f"  {t['date']}  {t['type']:<20}  {t['shares']:>12.4f}  {t['gross']:>14,.2f}  {t['account']}")
+        print(f"\nCash account transactions for: {sec['name']}")
+        print(f"{'Date':<12} {'Type':<22} {'Amount':>14} {'Account'}")
+        print("-" * 60)
+        atxs = sorted([t for t in pp.account_transactions if t['sec_uuid'] == uuid],
+                      key=lambda t: t['date'])
+        for t in atxs:
+            print(f"  {t['date']}  {t['type']:<20}  {t['amount']:>14,.2f}  {t['account']}")
+        print(f"\nTotal: {len(ptxs)} portfolio tx, {len(atxs)} account tx")
+        return
 
     if args.dump_raw_tx:
         import xml.etree.ElementTree as ET2
