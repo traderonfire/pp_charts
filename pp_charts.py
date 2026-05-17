@@ -85,6 +85,9 @@ class PPPortfolio:
         self.transactions  = []   # list of dicts  (portfolio: BUY/SELL/DELIVERY)
         self.account_transactions = []  # list of dicts (cash: fees/dividends/etc)
 
+        # Build parent map for ancestor lookups (used in Version B crossEntry parsing)
+        self._parent_map = {c: p for p in client.iter() for c in p}
+
         # Cache the top-level securities list for O(1) reference resolution.
         # PP XML references use 1-based indices into this exact list:
         #   reference="../../securities/security[42]"
@@ -98,10 +101,32 @@ class PPPortfolio:
         self._parse_account_transactions(client)
         self._autodetect_price_factor()        # figure out the raw v scale
         self._autodetect_share_factor()        # figure out the shares raw scale
-        # Re-apply correct share factor to all transactions (crossEntry ones parsed early)
+        # Re-apply correct share factor to all transactions
         for t in self.transactions:
             if t.get("shares_raw", 0) > 0:
                 t["shares"] = t["shares_raw"] / self._share_factor
+
+        # Re-seed transaction quotes now that shares are correct.
+        # Tx-seeded quotes computed during parsing used preliminary (wrong) shares
+        # via the gross/shares fallback, giving prices 10× too high/low.
+        # Overwrite only dates NOT in prices_raw (i.e. only tx-seeded entries).
+        for t in self.transactions:
+            if t["shares"] <= 0 or t["gross"] <= 0:
+                continue
+            sec = self.securities.get(t["sec_uuid"])
+            if not sec:
+                continue
+            tx_date = t["date"]
+            # Skip if this date has a real price from prices_raw
+            if tx_date in sec.get("prices_raw", {}):
+                continue
+            # Use raw_quote if available (most accurate)
+            raw_q = t.get("raw_quote", 0)
+            if raw_q > 0:
+                sec["prices"][tx_date] = raw_q / self._price_factor
+            else:
+                # Recompute from now-correct shares
+                sec["prices"][tx_date] = t["gross"] / t["shares"]
         self._finalise_prices()                # sort price arrays for fast bisect lookup
         self._detect_price_mode()              # per-share vs total-value prices
 
@@ -130,6 +155,10 @@ class PPPortfolio:
                 "prices":    prices,       # populated after auto-detect
                 "prices_raw": prices_raw,  # raw integer v values
             }
+
+    def _build_parent_map(self, client):
+        """Build a child→parent map for the entire XML tree for ancestor lookups."""
+        return {c: p for p in client.iter() for c in p}
 
     def _parse_crossentry_portfolio_transactions(self, client):
         """
@@ -186,18 +215,20 @@ class PPPortfolio:
                 if not sec_uuid or sec_uuid not in self.securities:
                     continue
 
-                # Find the portfolio name via reference
+                # Find the account name by walking up from acct_tx using parent_map.
+                # The portfolio reference inside crossEntry is an XStream back-reference
+                # that is difficult to resolve reliably; the account name is a better
+                # label since account and portfolio always share the same broker name.
                 port_name = "unknown"
-                port_ref_el = cross.find("portfolio")
-                if port_ref_el is not None:
-                    port_ref = port_ref_el.get("reference", "")
-                    if port_ref:
-                        # Resolve to find the portfolio element and its name
-                        for p in client.findall(".//portfolio"):
-                            if _text(p, "uuid"):
-                                # Try to match by walking the reference
-                                port_name = self.accounts.get(_text(p, "uuid"),
-                                                              _text(p, "name")) or port_name
+                if hasattr(self, '_parent_map'):
+                    cur = acct_tx
+                    for _ in range(10):
+                        cur = self._parent_map.get(cur)
+                        if cur is None:
+                            break
+                        if cur.tag == "account":
+                            port_name = _text(cur, "name") or port_name
+                            break
 
                 # Check not already parsed (avoid double-counting)
                 tx_uuid = ptx.findtext("uuid", "")
@@ -214,22 +245,16 @@ class PPPortfolio:
 
                 tx_date = _date(ptx) or _date(acct_tx)
 
-                # Seed price from quote element; store raw int for share factor detection
+                # Store raw quote for share factor detection only.
+                # Do NOT seed prices here — factors aren't known yet at parse time.
+                # Price seeding happens in the re-seeding step after factor detection.
                 quote_el = ptx.find("quote")
                 raw_quote_int = 0
                 if quote_el is not None and quote_el.text:
                     try:
                         raw_quote_int = int(quote_el.text)
-                        q_factor = getattr(self, '_price_factor', QUOTE_FACTOR)
-                        q = raw_quote_int / q_factor
-                        if q > 0 and tx_date not in self.securities[sec_uuid]["prices"]:
-                            self.securities[sec_uuid]["prices"][tx_date] = q
                     except (ValueError, TypeError):
                         pass
-                elif shares > 0 and gross > 0:
-                    q = gross / shares
-                    if q > 0 and tx_date not in self.securities[sec_uuid]["prices"]:
-                        self.securities[sec_uuid]["prices"][tx_date] = q
 
                 self.transactions.append({
                     "date":       tx_date,
@@ -441,10 +466,16 @@ class PPPortfolio:
         Auto-detect the scale factor used to store share counts in the XML.
         PP uses 1_000_000_000 (1e9) or 100_000_000 (1e8) depending on version.
 
-        Uses raw_quote integer from each transaction (already stored during parsing)
-        cross-referenced with gross amount to get correct_shares without any
-        circular dependency on the shares value itself:
+        Strategy 1 (preferred): use the raw <quote> element stored on the transaction.
             correct_shares = gross / (raw_quote / price_factor)
+            Fully independent of shares; no circular dependency.
+
+        Strategy 2 (fallback): use the nearest entry from prices_raw (the XML
+            historical price feed, already correctly scaled by price_factor).
+            correct_shares = gross / (nearest_prices_raw_value / price_factor)
+            Works for securities with a daily price feed (stocks/ETFs).
+            Uses prices_raw directly to avoid tx-seeded quotes (which are derived
+            from the preliminary wrong-shares value and so are circularly biased).
 
         The winning factor is applied globally to all transactions.
         """
@@ -455,33 +486,57 @@ class PPPortfolio:
         for t in self.transactions:
             if t["shares_raw"] <= 0 or t["gross"] <= 0:
                 continue
+
+            # Strategy 1: raw quote element on the transaction
             raw_quote = t.get("raw_quote", 0)
-            if raw_quote <= 0:
+            if raw_quote > 0:
+                quote_display = raw_quote / self._price_factor
+                if quote_display > 0:
+                    correct_shares = t["gross"] / quote_display
+                    if correct_shares > 0:
+                        evidence.append((t["shares_raw"], correct_shares, 2.0))
+                        continue   # strong evidence; don't also add strategy 2
+
+            # Strategy 2: nearest raw price entry from the XML price feed
+            sec = self.securities.get(t["sec_uuid"])
+            if not sec or not sec.get("prices_raw"):
                 continue
-            # Derive correct share count from gross and raw quote
-            # price_factor already detected; this is independent of shares
-            quote_display = raw_quote / self._price_factor
-            if quote_display <= 0:
+            raw_prices = sec["prices_raw"]
+            if not raw_prices:
                 continue
-            correct_shares = t["gross"] / quote_display
+            # Find closest raw price entry to the transaction date
+            tx_date = t["date"]
+            closest_date = min(raw_prices.keys(), key=lambda d: abs((d - tx_date).days))
+            gap_days = abs((closest_date - tx_date).days)
+            if gap_days > 365:
+                continue   # too far away to be a reliable anchor
+            raw_v = raw_prices[closest_date]
+            price_display = raw_v / self._price_factor
+            if price_display <= 0:
+                continue
+            correct_shares = t["gross"] / price_display
             if correct_shares <= 0:
                 continue
-            evidence.append((t["shares_raw"], correct_shares))
+            # Weight by proximity: daily data (gap≈0) gets full weight,
+            # yearly data (gap≈365) gets ~half weight
+            weight = 1.0 / (1.0 + gap_days / 30.0)
+            evidence.append((t["shares_raw"], correct_shares, weight))
 
         if not evidence:
             self._share_factor = NANO   # default
         else:
             best_factor = CANDIDATES[0]
             best_score  = float("inf")
+            total_w = sum(e[2] for e in evidence)
             for factor in CANDIDATES:
                 score = 0.0
-                for raw, correct in evidence:
+                for raw, correct, weight in evidence:
                     candidate = raw / factor
                     if candidate <= 0:
-                        score += 1e9
+                        score += weight * 1e9
                         continue
-                    score += (math.log(candidate) - math.log(correct)) ** 2
-                score /= len(evidence)
+                    score += weight * (math.log(candidate) - math.log(correct)) ** 2
+                score /= total_w
                 if score < best_score:
                     best_score  = score
                     best_factor = factor
@@ -603,15 +658,12 @@ class PPPortfolio:
         self._apply_price_factor()
 
     def _apply_price_factor(self):
-        """Divide all raw price integers by the detected factor into display prices."""
+        """Divide all raw price integers by the detected factor into display prices.
+        Raw XML prices always take precedence over tx-seeded quotes."""
         for sec in self.securities.values():
-            # prices already seeded from transaction quotes are in display units
-            # (added with factor=1 in _parse_transactions); keep those.
-            # Only convert the raw XML price entries.
-            display = dict(sec["prices"])   # copy of tx-seeded prices
+            display = dict(sec["prices"])   # start with tx-seeded prices
             for d, raw_v in sec["prices_raw"].items():
-                if d not in display:        # don't overwrite tx-seeded prices
-                    display[d] = raw_v / self._price_factor
+                display[d] = raw_v / self._price_factor  # raw prices OVERWRITE tx-seeded
             sec["prices"] = display
 
     def _detect_price_mode(self):
@@ -775,6 +827,7 @@ def build_series(
     account_name: str | None = None,
     start_date:   date | None = None,
     end_date:     date | None = None,
+    debug_dates:  list | None = None,
 ) -> pd.DataFrame:
     """
     Build a daily time-series DataFrame with columns:
@@ -862,6 +915,9 @@ def build_series(
         for t in day_txs:
             typ = t["type"]
             g   = t["gross"]
+            if debug_dates and d in debug_dates:
+                print(f"  TX {d}: {typ} shares={t['shares']:.4f} gross={g:.2f} "
+                      f"acct={t['account']} net_invest_before={net_invest[t['sec_uuid']]:.2f}")
             if typ == "BUY":
                 # Real cash outflow — increases invested capital
                 holdings[t["sec_uuid"]]   += t["shares"]
@@ -872,19 +928,16 @@ def build_series(
                     holdings[t["sec_uuid"]] - t["shares"], 0.0)
                 net_invest[t["sec_uuid"]] -= g
             elif typ in ("DELIVERY_INBOUND", "TRANSFER_IN"):
-                # Broker transfer in — shares arrive, cost basis preserved (not a new purchase)
-                holdings[t["sec_uuid"]] += t["shares"]
-                # Do NOT change net_invest — transfer is cash-flow neutral
+                # Shares arrive — treat like a BUY for invested capital.
+                # User records actual purchases as deliveries when not tracking cash.
+                # Broker-to-broker transfer pairs net to zero automatically.
+                holdings[t["sec_uuid"]]   += t["shares"]
+                net_invest[t["sec_uuid"]] += g
             elif typ in ("DELIVERY_OUTBOUND", "TRANSFER_OUT"):
-                # Broker transfer out — shares leave, cost basis preserved
-                frac = t["shares"] / max(holdings[t["sec_uuid"]], 1e-9)
-                frac = min(frac, 1.0)
-                # Carry the proportional invested capital with the shares
-                # (net_invest stays the same here; it will be restored by the matching INBOUND)
+                # Shares leave — treat like a SELL for invested capital.
                 holdings[t["sec_uuid"]] = max(
                     holdings[t["sec_uuid"]] - t["shares"], 0.0)
-                # Do NOT change net_invest — transfer is cash-flow neutral
-                net_invest[t["sec_uuid"]] -= g   # cash in → invested goes down
+                net_invest[t["sec_uuid"]] -= g
 
         # ── cash account transactions (no share movement) ─────────────
         for t in acct_tx_by_date.get(d, []):
@@ -905,12 +958,18 @@ def build_series(
         for u in uuid_set:
             mode = portfolio.securities[u].get("price_mode", "per_share")
             if mode == "total":
-                # price entry IS the total holding value; use raw prices only
-                # (tx-seeded quotes are per-share implied prices, wrong for total mode)
                 mkt += portfolio.get_price_raw(u, d) if holdings[u] > 0 else 0.0
             else:
-                mkt += holdings[u] * portfolio.get_price(u, d)
+                price = portfolio.get_price(u, d)
+                sh    = holdings[u]
+                mkt  += sh * price
+                if debug_dates and d in debug_dates:
+                    print(f"  DEBUG {d} [{u[:8]}]: holdings={sh:.6f}  "
+                          f"price={price:.4f}  contrib={sh*price:.2f}  "
+                          f"net_invest={net_invest[u]:.2f}")
         inv = sum(net_invest[u] for u in uuid_set)
+        if debug_dates and day.date() in debug_dates:
+            print(f"  DEBUG {day.date()} TOTAL: mkt={mkt:.2f}  inv={inv:.2f}  delta={mkt-inv:.2f}")
         rows.append({"date": day, "value": mkt, "invested": inv, "delta": mkt - inv})
 
     df = pd.DataFrame(rows).set_index("date")
@@ -1025,6 +1084,8 @@ def parse_args():
                    help="List all parsed transactions for a security in date order (diagnose wrong values)")
     p.add_argument("--list-accounts", action="store_true",
                    help="List all accounts and portfolios found in the XML, with transaction counts")
+    p.add_argument("--dump-ancestors", dest="dump_ancestors", metavar="TX_UUID",
+                   help="Show full XML ancestor chain for a transaction UUID (diagnose wrong account names)")
     return p.parse_args()
 
 
@@ -1042,6 +1103,44 @@ def main():
           f"{len(pp.transactions)} portfolio transactions, "
           f"{len(pp.account_transactions)} cash account transactions found.")
     print(f"  Price factor auto-detected: {pp._price_factor:,}  |  Share factor auto-detected: {pp._share_factor:,}")
+
+    if args.dump_ancestors:
+        target_uuid = args.dump_ancestors.strip()
+        tree2 = ET.parse(xml_path)
+        root2 = tree2.getroot()
+        client2 = root2 if root2.tag == "client" else root2.find("client") or root2
+        # Build full parent map
+        parent_map = {c: p for p in client2.iter() for c in p}
+        found = False
+        for el in client2.iter():
+            if el.findtext("uuid", "").strip() == target_uuid:
+                found = True
+                print(f"\nFound element <{el.tag}> with UUID {target_uuid}")
+                print("\nAncestor chain (bottom to top):")
+                cur = el
+                depth = 0
+                while cur in parent_map:
+                    cur = parent_map[cur]
+                    name = cur.findtext("name", "")
+                    uuid = cur.findtext("uuid", "")
+                    print(f"  {'  '*depth}<{cur.tag}>"
+                          f"  name={name!r}"
+                          f"  uuid={uuid[:12] if uuid else ''}")
+                    depth += 1
+                    if depth > 15:
+                        break
+                break
+        if not found:
+            print(f"UUID {target_uuid} not found in XML")
+            # Show first few portfolio-transaction UUIDs as examples
+            print("\nFirst 5 portfolio-transaction UUIDs in XML:")
+            for i, tx in enumerate(client2.iter("portfolio-transaction")):
+                u = tx.findtext("uuid","")
+                d = tx.findtext("date","")[:10]
+                t = tx.findtext("type","")
+                print(f"  {u}  {d}  {t}")
+                if i >= 4: break
+        return
 
     if args.list_accounts:
         print(f"\n{'Account/Portfolio':<40} {'UUID':<38} {'Tx count'}")
