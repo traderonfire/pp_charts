@@ -4,6 +4,9 @@ This document describes how to add the Value / Invested Capital / Delta chart na
 to Portfolio Performance as an additional tab in the security information pane (the panel
 at the bottom of the All Securities / Securities list views).
 
+A working Python proof-of-concept is available at [pp_charts repo link], validated
+against a real 139-security portfolio with multiple accounts and broker types.
+
 ---
 
 ## Overview of the change
@@ -15,11 +18,13 @@ The proposal adds one new tab: **Cash Flows** (or **P&L Chart**, or similar).
 
 When one or more securities are selected in the list, the Cash Flows tab shows:
 - **Value** over time (market value of the position)
-- **Invested Capital** over time (cumulative net cash deployed)  
+- **Invested Capital** over time (cumulative net cash deployed — can go negative after a profitable exit)
 - **Delta / P&L** over time (value minus invested capital)
 
 This is identical to the chart already available at the account level
-(`SecurityAccountView` → Chart tab), but scoped to the selected securities.
+(`SecurityAccountView` -> Chart tab), but scoped to the selected securities rather than
+a whole account. When multiple securities are selected they are combined into a single
+set of three lines — not one set per security.
 
 ---
 
@@ -40,10 +45,10 @@ The key data model classes are in `name.abuchen.portfolio/`:
 |---|---|
 | `Portfolio` | A securities account — has `getTransactions()` |
 | `PortfolioTransaction` | A single BUY/SELL/DELIVERY_* transaction with `getSecurity()`, `getShares()`, `getMonetaryAmount()` |
+| `AccountTransaction` | A cash account transaction (dividends, fees, taxes, etc.) with `getSecurity()` |
 | `Security` | A security — has `getPrices()` returning `List<SecurityPrice>` |
 | `SecurityPrice` | A date + quote pair |
 | `Client` | Root object — has `getPortfolios()` and `getAccounts()` |
-| `ClientSnapshot` | A point-in-time snapshot — less useful here since we need a time series |
 
 ---
 
@@ -51,8 +56,8 @@ The key data model classes are in `name.abuchen.portfolio/`:
 
 ### Step 1 — Create the data builder
 
-Create a new class `SecurityCashFlowsBuilder` (or extend `StatementOfAssetsHistoryBuilder`)
-in `name.abuchen.portfolio.ui/src/name/abuchen/portfolio/ui/views/charts/`.
+Create a new class `SecurityCashFlowsBuilder` in
+`name.abuchen.portfolio.ui/src/name/abuchen/portfolio/ui/views/charts/`.
 
 ```java
 package name.abuchen.portfolio.ui.views.charts;
@@ -63,21 +68,14 @@ import name.abuchen.portfolio.model.*;
 import name.abuchen.portfolio.money.CurrencyConverter;
 import name.abuchen.portfolio.util.Interval;
 
-/**
- * Builds daily time-series data for the per-security cash flow chart:
- * market value, invested capital (net deposits), and delta (P&L).
- *
- * Mirrors the logic in StatementOfAssetsHistoryBuilder but filtered
- * to a specific set of securities rather than an entire account.
- */
 public class SecurityCashFlowsBuilder
 {
     public static class DailyValues
     {
         public LocalDate date;
-        public long value;           // market value in hecto units
-        public long investedCapital; // net cash deployed in hecto units (can be negative)
-        public long delta;           // value - investedCapital
+        public long value;            // market value in hecto units
+        public long investedCapital;  // net cash deployed in hecto units (can be negative)
+        public long delta;            // value - investedCapital
     }
 
     private final Client client;
@@ -96,59 +94,55 @@ public class SecurityCashFlowsBuilder
     {
         Set<Security> securitySet = new HashSet<>(securities);
 
-        // --- collect all relevant portfolio transactions ---
-        // Group by date for efficient replay
+        // client.getPortfolios() returns all Portfolio objects and their transactions
+        // regardless of XStream serialization order. The Java object model resolves
+        // all crossEntry references transparently — no need to handle the two
+        // serialization variants (portfolio-primary vs account-primary) explicitly.
         Map<LocalDate, List<PortfolioTransaction>> txByDate = new TreeMap<>();
         for (Portfolio portfolio : client.getPortfolios())
-        {
             for (PortfolioTransaction tx : portfolio.getTransactions())
             {
-                if (!securitySet.contains(tx.getSecurity()))
-                    continue;
+                if (!securitySet.contains(tx.getSecurity())) continue;
                 txByDate.computeIfAbsent(tx.getDate(), k -> new ArrayList<>()).add(tx);
             }
-        }
 
-        // --- collect cash account transactions (fees, dividends, etc.) ---
         Map<LocalDate, List<AccountTransaction>> acctTxByDate = new TreeMap<>();
         for (Account account : client.getAccounts())
-        {
             for (AccountTransaction tx : account.getTransactions())
             {
-                if (tx.getSecurity() == null || !securitySet.contains(tx.getSecurity()))
-                    continue;
-                // Only types that affect invested capital
-                switch (tx.getType())
-                {
-                    case FEES:
-                    case FEES_REFUND:
-                    case TAXES:
-                    case TAX_REFUND:
-                    case DIVIDENDS:
-                    case INTEREST:
-                    case INTEREST_CHARGE:
+                if (tx.getSecurity() == null || !securitySet.contains(tx.getSecurity())) continue;
+                switch (tx.getType()) {
+                    case FEES: case FEES_REFUND: case TAXES: case TAX_REFUND:
+                    case DIVIDENDS: case INTEREST: case INTEREST_CHARGE:
                         acctTxByDate.computeIfAbsent(tx.getDate(), k -> new ArrayList<>()).add(tx);
                         break;
-                    default:
-                        break;
+                    default: break;
                 }
             }
-        }
 
-        // --- replay day by day over the interval ---
-        Map<Security, Long> holdings       = new HashMap<>(); // shares in nano units
-        Map<Security, Long> netInvested    = new HashMap<>(); // hecto units (can be negative)
-
-        List<DailyValues> result = new ArrayList<>();
+        Map<Security, Long> holdings    = new HashMap<>();
+        Map<Security, Long> netInvested = new HashMap<>();
+        List<DailyValues>   result      = new ArrayList<>();
         LocalDate cursor = interval.getStart();
 
         while (!cursor.isAfter(interval.getEnd()))
         {
-            // Process portfolio transactions on this day
-            for (PortfolioTransaction tx : txByDate.getOrDefault(cursor, Collections.emptyList()))
+            // Sort same-day transactions: OUTBOUNDs before INBOUNDs.
+            // This prevents momentary zero-holdings during same-day broker transfers,
+            // which would cause a spurious value=0 in the chart for that day.
+            List<PortfolioTransaction> dayTxs = new ArrayList<>(
+                txByDate.getOrDefault(cursor, Collections.emptyList()));
+            dayTxs.sort(Comparator.comparingInt(tx -> {
+                switch (tx.getType()) {
+                    case SELL: case DELIVERY_OUTBOUND: case TRANSFER_OUT: return 0;
+                    default: return 1;
+                }
+            }));
+
+            for (PortfolioTransaction tx : dayTxs)
             {
-                long shares = tx.getShares();   // nano units
-                long amount = tx.getAmount();   // hecto units (gross)
+                long shares = tx.getShares();
+                long amount = tx.getAmount();
                 Security sec = tx.getSecurity();
 
                 switch (tx.getType())
@@ -156,81 +150,67 @@ public class SecurityCashFlowsBuilder
                     case BUY:
                     case DELIVERY_INBOUND:
                     case TRANSFER_IN:
+                        // DELIVERY_INBOUND is treated identically to BUY.
+                        // Users commonly record purchases as deliveries when not
+                        // maintaining a paired cash account. Broker-to-broker transfer
+                        // pairs (DELIVERY_OUTBOUND + matching DELIVERY_INBOUND on the
+                        // same day for the same amount) net to zero automatically.
                         holdings.merge(sec, shares, Long::sum);
-                        netInvested.merge(sec, amount, Long::sum);  // cash out → invested up
+                        netInvested.merge(sec, amount, Long::sum);
                         break;
 
                     case SELL:
                     case DELIVERY_OUTBOUND:
                     case TRANSFER_OUT:
                         holdings.merge(sec, -shares, Long::sum);
-                        netInvested.merge(sec, -amount, Long::sum); // cash in → invested down
+                        netInvested.merge(sec, -amount, Long::sum);
                         break;
 
-                    default:
-                        break;
+                    default: break;
                 }
             }
 
-            // Process cash account transactions on this day
             for (AccountTransaction tx : acctTxByDate.getOrDefault(cursor, Collections.emptyList()))
             {
-                long amount = tx.getAmount(); // hecto units
+                // TODO: apply converter.convert(cursor, tx.getMonetaryAmount()) for
+                // multi-currency portfolios (same pattern as StatementOfAssetsHistoryBuilder)
+                long amount = tx.getAmount();
                 Security sec = tx.getSecurity();
 
-                switch (tx.getType())
-                {
-                    case FEES:
-                    case TAXES:
-                    case INTEREST_CHARGE:
-                        netInvested.merge(sec, amount, Long::sum);   // cost → invested up
+                switch (tx.getType()) {
+                    case FEES: case TAXES: case INTEREST_CHARGE:
+                        netInvested.merge(sec, amount, Long::sum);
                         break;
-                    case FEES_REFUND:
-                    case TAX_REFUND:
-                    case DIVIDENDS:
-                    case INTEREST:
-                        netInvested.merge(sec, -amount, Long::sum);  // receipt → invested down
+                    case FEES_REFUND: case TAX_REFUND: case DIVIDENDS: case INTEREST:
+                        netInvested.merge(sec, -amount, Long::sum);
                         break;
-                    default:
-                        break;
+                    default: break;
                 }
             }
 
-            // Calculate market value: shares × latest price
             long mkt = 0L;
             for (Security sec : securities)
             {
                 long sharesHeld = holdings.getOrDefault(sec, 0L);
-                if (sharesHeld <= 0)
-                    continue;
+                if (sharesHeld <= 0) continue;
                 SecurityPrice price = sec.getSecurityPrice(cursor);
                 if (price != null)
-                {
-                    // shares (nano) × price (Quote.factor) / (NANO/HECTO) → hecto
-                    // Quote.factor = 100_000_000; NANO = 1_000_000_000; HECTO = 100
-                    // simplify: shares * price / (NANO * Quote.factor / HECTO)
                     mkt += Math.round(sharesHeld * price.getValue()
                                       / (double) Values.Share.factor()
                                       / (double) Values.Quote.factor()
                                       * Values.Amount.factor());
-                }
             }
 
             long inv = 0L;
             for (Security sec : securities)
                 inv += netInvested.getOrDefault(sec, 0L);
 
-            if (cursor.isAfter(interval.getStart()) || !result.isEmpty()
-                            || mkt != 0 || inv != 0)
-            {
-                DailyValues dv = new DailyValues();
-                dv.date           = cursor;
-                dv.value          = mkt;
-                dv.investedCapital = inv;
-                dv.delta          = mkt - inv;
-                result.add(dv);
-            }
-
+            DailyValues dv  = new DailyValues();
+            dv.date          = cursor;
+            dv.value         = mkt;
+            dv.investedCapital = inv;
+            dv.delta         = mkt - inv;
+            result.add(dv);
             cursor = cursor.plusDays(1);
         }
 
@@ -239,91 +219,52 @@ public class SecurityCashFlowsBuilder
 }
 ```
 
-> **Note on currency conversion:** The above assumes all securities share the same base currency. For a multi-currency portfolio, wrap `tx.getMonetaryAmount()` through `converter.convert(cursor, amount)` before accumulating, using the same pattern as `StatementOfAssetsHistoryBuilder`.
-
 ---
 
 ### Step 2 — Create the chart widget
 
-Create `SecurityCashFlowsChart.java` in the same views package, extending the existing `TimelineChart` (already used by `SecuritiesChart`).
+Create `SecurityCashFlowsChart.java` extending the existing `TimelineChart`:
 
 ```java
-package name.abuchen.portfolio.ui.views;
-
-import java.util.List;
-import org.eclipse.swt.widgets.Composite;
-import name.abuchen.portfolio.ui.util.chart.TimelineChart;
-import name.abuchen.portfolio.ui.views.charts.SecurityCashFlowsBuilder;
-import name.abuchen.portfolio.ui.views.charts.SecurityCashFlowsBuilder.DailyValues;
-
 public class SecurityCashFlowsChart extends TimelineChart
 {
-    public SecurityCashFlowsChart(Composite parent)
-    {
-        super(parent);
-        // TimelineChart sets up axes, zoom, date formatting, context menus
-    }
+    public SecurityCashFlowsChart(Composite parent) { super(parent); }
 
     public void update(List<DailyValues> data, String currency)
     {
-        clearAll(); // clear existing series
+        clearAll();
+        double[] dates = new double[data.size()];
+        double[] values = new double[data.size()];
+        double[] invested = new double[data.size()];
+        double[] delta = new double[data.size()];
 
-        double[] dates      = new double[data.size()];
-        double[] values     = new double[data.size()];
-        double[] invested   = new double[data.size()];
-        double[] delta      = new double[data.size()];
-
-        for (int i = 0; i < data.size(); i++)
-        {
+        for (int i = 0; i < data.size(); i++) {
             DailyValues dv = data.get(i);
             dates[i]    = TimelineChart.toDouble(dv.date);
-            // Convert from hecto to display units
-            values[i]   = dv.value    / 100.0;
+            values[i]   = dv.value           / 100.0;
             invested[i] = dv.investedCapital / 100.0;
-            delta[i]    = dv.delta    / 100.0;
+            delta[i]    = dv.delta           / 100.0;
         }
 
-        // Add area fill for delta (green above zero, red below)
-        addBaseLine(dates, new double[data.size()]); // zero baseline
-
-        ILineSeries valueSeries = addDateSeries(
-            dates, values, Messages.LabelValue, // add to Messages.properties
-            ColorConstants.darkGreen); // purple in original; use theme colour
-        valueSeries.setLineWidth(2);
-
-        ILineSeries investedSeries = addDateSeries(
-            dates, invested, Messages.LabelInvestedCapital,
-            ColorConstants.orange);
-        investedSeries.setLineWidth(2);
-
-        ILineSeries deltaSeries = addDateSeries(
-            dates, delta, Messages.LabelDelta,
-            ColorConstants.blue);
-        deltaSeries.setLineWidth(2);
-
-        // Fill delta area (positive = green, negative = red)
-        // PP's existing charts use RangeMarker or area fill — adapt as per
-        // the pattern in StatementOfAssetsHistoryBuilder.buildChart()
-
+        addBaseLine(dates, new double[data.size()]);
+        addDateSeries(dates, values,   Messages.LabelValue,          ColorConstants.darkGreen).setLineWidth(2);
+        addDateSeries(dates, invested, Messages.LabelInvestedCapital, ColorConstants.orange).setLineWidth(2);
+        addDateSeries(dates, delta,    Messages.LabelDelta,           ColorConstants.blue).setLineWidth(2);
+        // Area fill behind delta — follow pattern in StatementOfAssetsHistoryBuilder.buildChart()
         adjustRange();
     }
 }
 ```
 
-The exact SWT/SWTCHART API calls should mirror those in `SecuritiesChart.java` — look at how it adds line series and fills — to stay consistent with PP's existing chart style.
+Mirror the exact SWT/SWTCHART API calls from `SecuritiesChart.java` for consistency.
 
 ---
 
 ### Step 3 — Add the tab to SecurityListView
 
-In `SecurityListView.java`, find the method that creates the tab folder for the information pane (look for `CTabFolder` or `createBottomTable`). Add a new `CTabItem` alongside the existing Chart tab:
-
 ```java
-// Inside the method that builds the information pane tab folder:
-
 CTabItem cashFlowsTab = new CTabItem(tabFolder, SWT.NONE);
-cashFlowsTab.setText(Messages.LabelCashFlowsChart); // add to Messages.properties
-cashFlowsTab.setImage(/* reuse an existing chart icon */);
+cashFlowsTab.setText(Messages.LabelCashFlowsChart);
 
 Composite cashFlowsComposite = new Composite(tabFolder, SWT.NONE);
 cashFlowsComposite.setLayout(new FillLayout());
@@ -332,39 +273,26 @@ cashFlowsTab.setControl(cashFlowsComposite);
 SecurityCashFlowsChart cashFlowsChart = new SecurityCashFlowsChart(cashFlowsComposite);
 ```
 
-Then in the selection listener that fires when a security is selected or the tab is switched:
+Update lazily in the tab selection listener:
 
 ```java
 private void updateCashFlowsChart(List<Security> selected)
 {
-    if (selected == null || selected.isEmpty())
-    {
-        cashFlowsChart.clearAll();
-        return;
-    }
-
-    // Determine interval: from first transaction to today
-    Interval interval = computeIntervalForSecurities(selected); // helper method
-
-    SecurityCashFlowsBuilder builder = new SecurityCashFlowsBuilder(
-        getClient(),
-        getClient().getBaseCurrency(), // or converter
-        selected);
-
-    List<DailyValues> data = builder.calculate(interval);
-    cashFlowsChart.update(data, getClient().getBaseCurrency());
+    if (selected == null || selected.isEmpty()) { cashFlowsChart.clearAll(); return; }
+    Interval interval = computeIntervalForSecurities(selected);
+    SecurityCashFlowsBuilder builder = new SecurityCashFlowsBuilder(getClient(), converter, selected);
+    cashFlowsChart.update(builder.calculate(interval), getClient().getBaseCurrency());
 }
 ```
 
-Hook `updateCashFlowsChart` into:
-1. The existing `selectionChanged` listener (fires when the user selects different securities)
-2. The tab folder's `selectionListener` (fires when the user switches to the Cash Flows tab — to avoid computing it until needed)
+Hook into the `selectionChanged` listener AND the tab folder's `selectionListener`
+(so the chart is only computed when the tab is actually visible).
 
 ---
 
 ### Step 4 — Add message strings
 
-In `name.abuchen.portfolio.ui/src/name/abuchen/portfolio/ui/Messages.properties` (and all language variants), add:
+In `Messages.properties` (and all language variants):
 
 ```
 LabelCashFlowsChart = Cash Flows
@@ -373,37 +301,32 @@ LabelInvestedCapital = Invested Capital
 LabelDelta = Delta (P\&L)
 ```
 
-And in `Messages.java` (the generated constants class):
-
-```java
-public static String LabelCashFlowsChart;
-public static String LabelValue;
-public static String LabelInvestedCapital;
-public static String LabelDelta;
-```
-
 ---
 
 ### Step 5 — Extend to security accounts view
 
-The same tab should appear in `SecurityAccountView.java` (the per-account information pane), scoped to securities within that account. The builder already accepts a `List<Security>` so this is straightforward — filter `client.getPortfolios()` to the selected account when collecting transactions.
+Same pattern in `SecurityAccountView.java`, filtering transactions to the selected
+account. The builder's `List<Security>` parameter already supports this.
 
 ---
 
 ## Key design decisions to discuss with @buchen
 
-**1. Multi-security selection.** The existing Chart tab shows each selected security as a separate price line. The Cash Flows tab should combine them into a single set of three lines (total value, total invested, total delta). Make this explicit in the PR description. There is an open PR (#multiple_securities_chart by @OnkelDok) adding per-security lines to the existing chart — coordinate to avoid conflicts.
+**1. Multi-security selection.** Combine selected securities into a single set of three
+lines (total value, total invested, total delta). Coordinate with the open PR by
+@OnkelDok to avoid conflicts in `SecurityListView.java`.
 
-**2. Reporting period integration.** PP has a global reporting period selector. The Cash Flows chart is most useful when it always starts from the first transaction regardless of the reporting period (since it shows the full investment journey). Discuss whether to respect the global period or always show the full history. The simplest PR respects the global period; a follow-up can add a "Show full history" toggle.
+**2. Reporting period.** The Cash Flows chart is most useful starting from the first
+transaction (showing the full investment journey). Suggest always showing full history,
+with a follow-up option to respect the global period selector.
 
-**3. Currency handling.** For multi-currency portfolios, decide whether to show values in:
-   - The security's native currency (simplest; works well for single-security view)
-   - The portfolio base currency (requires FX conversion; better for multi-security groups)
-   Use `CurrencyConverter` for the latter — the same approach as `StatementOfAssetsHistoryBuilder`.
+**3. Currency handling.** Apply `CurrencyConverter` to account transaction amounts for
+multi-currency portfolios — same pattern as `StatementOfAssetsHistoryBuilder`. Without
+this, dividends or fees paid in a different currency are included at face value.
 
-**4. Performance.** Computing daily values for all 365 × N days can be slow for large portfolios. The builder should only recalculate when the tab is visible and the selection changes. Use lazy evaluation — do not compute in the selection listener, compute in the tab's `visibleChanged` event.
-
-**5. Price mode (total vs per-share).** For manually-valued assets (real estate etc.), PP may store total holding value as the price rather than a per-share price. The `Security.getSecurityPrice()` API returns the raw price — whether to multiply by shares or use directly depends on how the user entered data. Discuss with @buchen whether PP has an internal flag for this or whether it should be detected heuristically (as the Python script does).
+**4. Performance.** Compute lazily on tab selection. For portfolios with long daily
+price histories the day-by-day replay can take noticeable time — cache the result and
+invalidate only when the selection or underlying data changes.
 
 ---
 
@@ -414,57 +337,57 @@ The same tab should appear in `SecurityAccountView.java` (the per-account inform
 | **Create** | `name.abuchen.portfolio.ui/.../views/charts/SecurityCashFlowsBuilder.java` |
 | **Create** | `name.abuchen.portfolio.ui/.../views/SecurityCashFlowsChart.java` |
 | **Modify** | `name.abuchen.portfolio.ui/.../views/SecurityListView.java` |
-| **Modify** | `name.abuchen.portfolio.ui/.../views/SecurityAccountView.java` (optional, same pattern) |
+| **Modify** | `name.abuchen.portfolio.ui/.../views/SecurityAccountView.java` (optional) |
 | **Modify** | `name.abuchen.portfolio.ui/.../Messages.properties` (and language variants) |
 | **Modify** | `name.abuchen.portfolio.ui/.../Messages.java` |
-| **Create** | `name.abuchen.portfolio.ui/.../views/charts/SecurityCashFlowsBuilderTest.java` (unit tests) |
+| **Create** | `name.abuchen.portfolio.ui/.../views/charts/SecurityCashFlowsBuilderTest.java` |
 
 ---
 
-## How to set up the development environment
+## Development environment setup
 
-1. Clone the repo: `git clone https://github.com/portfolio-performance/portfolio`
-2. Import into Eclipse as an existing Maven project (the codebase is Eclipse RCP / OSGi)
-3. Install the Eclipse PDE (Plugin Development Environment) if not already installed
-4. Run target: **portfolio-target-definition** → Set as Active Target Platform
-5. Launch configuration: **name.abuchen.portfolio.ui** → Run As → Eclipse Application
+1. `git clone https://github.com/portfolio-performance/portfolio`
+2. Import into Eclipse as an existing Maven project (Eclipse RCP / OSGi)
+3. Install Eclipse PDE
+4. Set **portfolio-target-definition** as the Active Target Platform
+5. Run As → Eclipse Application from `name.abuchen.portfolio.ui`
 
-Full dev setup instructions: https://github.com/portfolio-performance/portfolio/blob/master/CONTRIBUTING.md
+Full instructions: https://github.com/portfolio-performance/portfolio/blob/master/CONTRIBUTING.md
 
 ---
 
-## Suggested PR title and description template
+## Suggested PR title and description
 
 **Title:** `feat: add Cash Flows tab to security information pane (value/invested capital/delta)`
 
-**Description:**
+**Body:**
 ```
 ### Motivation
 
-The account-level chart (Statement of Assets → Chart) shows Value, Invested Capital
-and Delta over time — a powerful way to see how an investment is actually performing
-including all cash flows. This view is not available at the security level.
+The account-level chart (Statement of Assets -> Chart) shows Value, Invested Capital
+and Delta over time. This view is not available at the security level.
 
-This PR adds a "Cash Flows" tab to the security information pane in the All Securities
-view, showing the same three lines scoped to the selected security or securities.
+This PR adds a "Cash Flows" tab to the security information pane, showing the same
+three lines scoped to the selected security or group of securities.
 
-Closes #XXXX  ← link to feature request issue
+Closes #XXXX
 
 ### What changes
 
-- New `SecurityCashFlowsBuilder` computes daily value/invested capital/delta series
-  for an arbitrary list of securities, replaying portfolio and cash account transactions.
-- New `SecurityCashFlowsChart` renders the result using the existing TimelineChart.
-- `SecurityListView` gets a new "Cash Flows" tab alongside the existing "Chart" tab.
+- New SecurityCashFlowsBuilder computes daily value/invested capital/delta series
+  for an arbitrary list of securities.
+- New SecurityCashFlowsChart renders the result using the existing TimelineChart.
+- SecurityListView gets a new "Cash Flows" tab.
 
-### Screenshots
+### Transaction handling
 
-[attach before/after screenshots]
+DELIVERY_INBOUND/OUTBOUND and TRANSFER_IN/OUT are treated the same as BUY/SELL
+for invested capital. Users commonly record purchases as deliveries when not tracking
+a paired cash account. Same-day broker transfer pairs net to zero automatically.
 
-### Notes for review
+### Notes
 
-- Currency conversion: currently uses native currency per security; FX conversion
-  can be added in a follow-up.
-- Reporting period: respects the global period selector.
-- Performance: chart is computed lazily on tab selection, not on every security click.
+- Currency: face-value inclusion; FX conversion via CurrencyConverter in follow-up.
+- Reporting period: full history from first transaction.
+- Performance: lazily computed on tab selection.
 ```
