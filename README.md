@@ -28,6 +28,43 @@ Python 3.10 or later.
 
 ---
 
+## Faster alternative: SQLite backend (`pp_charts_db.py`)
+
+If you have [ppxml2db](https://github.com/pfalcon/ppxml2db), you can convert your
+PP XML to a SQLite database and use `pp_charts_db.py` instead. This is significantly
+faster — a 167-security portfolio loads in ~2s instead of ~30s, because it queries
+an indexed database rather than parsing raw XML.
+
+**Setup:**
+
+```bash
+# Install ppxml2db
+pip install ppxml2db   # or clone https://github.com/pfalcon/ppxml2db
+
+# Convert your PP XML to SQLite
+ppxml2db family_office.portfolio.xml family_office.db
+```
+
+Then use `pp_charts_db.py` with identical syntax — just point it at the `.db` file:
+
+```bash
+python pp_charts_db.py family_office.db --list
+python pp_charts_db.py family_office.db --assets VTI
+python pp_charts_db.py family_office.db --assets VTI VXUS BND --save chart.png
+python pp_charts_db.py family_office.db --all
+```
+
+All flags work identically to `pp_charts.py`. The diagnostic flags `--dump-raw-tx`
+and `--dump-ancestors` are not available in the DB version (they inspect raw XML
+structure), but `--list-tx`, `--list-accounts`, and `--debug-prices` all work.
+
+**Keeping the database up to date:** re-run `ppxml2db` after adding transactions in PP.
+The conversion takes a few seconds.
+
+---
+
+---
+
 ## Usage
 
 First, export your portfolio from PP as XML: **File → Save As → XML** (your working `.portfolio` binary file is untouched).
@@ -129,16 +166,23 @@ Start with `--list-tx` — it shows every transaction the script found, with dat
 
 ## Known PP version compatibility
 
-Tested against PP XML files from versions 0.65–0.70. The XML schema is stable; the script should work with any version that uses the standard `<client>` root element.
+`pp_charts.py` is tested against PP XML files from versions 0.65–0.70. The XML schema
+is stable; the script should work with any version that uses the standard `<client>`
+root element.
+
+`pp_charts_db.py` depends on the ppxml2db schema, which is tested against the same
+PP versions. ppxml2db handles the XStream serialization variants (both portfolio-primary
+and account-primary crossEntry formats) transparently.
 
 ---
 
 ## Related
 
 - [Portfolio Performance](https://www.portfolio-performance.info) — the application this script reads
+- [ppxml2db](https://github.com/pfalcon/ppxml2db) — converts PP XML to SQLite; used by `pp_charts_db.py`
 - [PP Forum](https://forum.portfolio-performance.info) — community discussion
 - [PP GitHub](https://github.com/portfolio-performance/portfolio) — source code and issue tracker
-- [Feature request: per-security cash flow chart](https://github.com/portfolio-performance/portfolio/issues/) — the upstream issue this script works around
+- [Feature request: per-security cash flow chart](https://github.com/portfolio-performance/portfolio/issues/5674) — the upstream issue this script works around
 
 ---
 
